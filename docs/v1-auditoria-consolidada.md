@@ -8,7 +8,7 @@
 > - Doc3: `auditoria-v1-spec.md` — Revision cruzada contra investigaciones (8 brechas + 4 inconsistencias + 10 omisiones)
 > **Metodo:** Consolidacion y deduplicacion de 3 auditorias independientes. En merges, se uso la descripcion mas rica como base y se enriquecio con las demas.
 > **Ultima revision:** 2026-02-27
-> **Estado de incorporacion:** 10 resueltos, 9 parciales, 3 pendientes
+> **Estado de incorporacion:** 12 resueltos, 7 parciales, 3 pendientes
 
 ---
 
@@ -18,21 +18,21 @@ Esta auditoria consolida los hallazgos de 3 revisiones independientes de `v1-spe
 
 | Estado | Cantidad | Significado |
 |--------|----------|-------------|
-| **RESUELTO** | 10 | Incorporado completamente en v1-spec.md |
-| **PARCIAL** | 9 | Incorporado con gaps residuales |
+| **RESUELTO** | 12 | Incorporado completamente en v1-spec.md |
+| **PARCIAL** | 7 | Incorporado con gaps residuales |
 | **PENDIENTE** | 3 | No incorporado en v1-spec.md |
 
 **Desglose por prioridad:**
 
 | Prioridad | Total | Resueltos | Parciales | Pendientes |
 |-----------|-------|-----------|-----------|------------|
-| **P0** | 6 | 5 (SEC-2, SEC-3, OBS-1, OBS-2, OPS-2) | 1 (SEC-1) | — |
-| **P1** | 5 | 3 (REL-1, REL-2, REL-3) | 2 (OPS-1, PLT-1) | — |
+| **P0** | 6 | 6 (SEC-1, SEC-2, SEC-3, OBS-1, OBS-2, OPS-2) | — | — |
+| **P1** | 5 | 4 (REL-1, REL-2, REL-3, PLT-1) | 1 (OPS-1) | — |
 | **P2** | 5 | 1 (REL-4) | 4 (PLT-2, PLT-3, DOC-1, DOC-5) | — |
 | **P3** | 6 | 1 (DOC-4) | 2 (OBS-3, DOC-2) | 3 (DOC-3, DOC-6, DOC-7) |
 
 **Lo que queda por hacer:**
-- **Gaps residuales mas importantes:** pseudocodigo bash obsoleto en §5.2/§6.1 (SEC-1, PLT-1, PLT-3), seccion de Alcance de Autonomia ausente (DOC-1), costos subestimados en ADRs (DOC-2)
+- **Gaps residuales mas importantes:** §6.1 "Modelo Dual" contradice implementacion §14 (PLT-3), seccion de Alcance de Autonomia ausente (DOC-1), costos subestimados en ADRs (DOC-2)
 - **Pendientes sin resolver:** prompt caching no mencionado (DOC-3), invocacion de skills por lenguaje natural (DOC-6), omisiones menores de completitud (DOC-7)
 
 ---
@@ -41,7 +41,7 @@ Esta auditoria consolida los hallazgos de 3 revisiones independientes de `v1-spe
 
 | ID | Hallazgo | Prioridad | Esfuerzo | Impacto | Estado |
 |----|----------|-----------|----------|---------|--------|
-| SEC-1 | `--disallowedTools` como defensa en profundidad | **P0** | Bajo | Seguridad critica | PARCIAL (gap) |
+| SEC-1 | `--disallowedTools` como defensa en profundidad | **P0** | Bajo | Seguridad critica | RESUELTO |
 | SEC-2 | Proteccion contra prompt injection via emails | **P0** | Bajo | Seguridad critica | RESUELTO |
 | SEC-3 | Credenciales expuestas en `.env` y `.gitignore` incompleto | **P0** | Bajo | Seguridad critica | RESUELTO |
 | REL-1 | Deduplicacion de emails procesados | **P1** | Medio | Fiabilidad core | RESUELTO |
@@ -53,7 +53,7 @@ Esta auditoria consolida los hallazgos de 3 revisiones independientes de `v1-spe
 | OBS-3 | Rotacion de logs | **P3** | 30 min | Mantenibilidad | PARCIAL (gap) |
 | OPS-1 | OAuth "Testing" expira cada 7 dias | **P1** | Bajo | Blocker operacional | PARCIAL (gap) |
 | OPS-2 | `--max-turns` en heartbeat principal + timeout explicito | **P0** | 30 min | Control de costos y resiliencia | RESUELTO |
-| PLT-1 | Migrar wrapper de `.bat` a Python | **P1** | 1-2 horas | Blocker: sintaxis incorrecta | PARCIAL (gap) |
+| PLT-1 | Migrar wrapper de `.bat` a Python | **P1** | 1-2 horas | Blocker: sintaxis incorrecta | RESUELTO |
 | PLT-2 | Inconsistencia Windows vs investigaciones macOS | **P2** | Alto | Consistencia plataforma | PARCIAL (gap) |
 | PLT-3 | Modelo dual "Despertador + Cronometro" irrealizable en Windows | **P2** | Medio | Claridad arquitectonica | PARCIAL (gap) |
 | DOC-1 | Falta seccion de Alcance de Autonomia | **P2** | Bajo | Seguridad y documentacion | PARCIAL (gap) |
@@ -73,9 +73,8 @@ Esta auditoria consolida los hallazgos de 3 revisiones independientes de `v1-spe
 **Severidad:** Critica | **Prioridad:** P0
 **Secciones afectadas:** v1-spec.md §8.3, §14.2, §18
 
-> **Estado:** PARCIAL — pseudocodigo obsoleto inconsistente con requisito
-> **Resuelto:** §8.3, §14.2, §18.2, §18.3 documentan ambos flags correctamente
-> **Gap residual:** §5.2 Paso 1 linea 210 muestra `claude -p "$(type HEARTBEAT.md)"` sin --disallowedTools. Es pseudocodigo obsoleto pero inconsistente con el requisito de "ambos flags en toda invocacion".
+> **Estado:** RESUELTO en v1-spec.md
+> **Evidencia:** §5.2 Paso 1 (corregido: ahora incluye ambos flags + alineado con arquitectura Python), §8.3, §14.2 paso 5a (corregido: $(type) reemplazado por placeholder Python), §18.2, §18.3. Todas las invocaciones de `claude -p` en el spec incluyen ambos flags.
 
 #### Situacion actual
 
@@ -411,9 +410,8 @@ Si salta el timeout: matar proceso, loguear error, liberar lock, continuar al si
 **Severidad:** Alta | **Prioridad:** P1
 **Secciones afectadas:** v1-spec.md §6.3, §13, §14.2, §14.3
 
-> **Estado:** PARCIAL — implementacion migro a Python pero pseudocodigo no actualizado
-> **Resuelto:** Arquitectura es Python (§4.1, §5.2, §14.2 con subprocess.run/try-finally). agent/main.py en estructura.
-> **Gap residual:** Sintaxis `$(type HEARTBEAT.md)` (bash) persiste en lineas 210 y 1045. Son los mismos bash-ismos que la auditoria original identificaba. La implementacion conceptual migro a Python pero el pseudocodigo no se actualizo.
+> **Estado:** RESUELTO en v1-spec.md
+> **Evidencia:** Arquitectura es Python (§4.1, §5.2, §14.2 con subprocess.run/try-finally). agent/main.py en estructura. §6.1 atribuye pre-flight a `agent/main.py`. §14.2 titulado como flujo de `agent/main.py` con nota de delegacion desde .bat. §14.3a sin alternativa batch. Sintaxis `$(type)` corregida al resolver SEC-1.
 
 #### Situacion actual
 
@@ -667,7 +665,7 @@ La auditoria general (Doc2) evaluo 44 hallazgos iniciales y descarto 39 como fal
 
 | Hallazgo original | Razon de descarte |
 |-------------------|-------------------|
-| Sintaxis bash `$(type ...)` invalida en Windows | Pseudocodigo en un spec, no codigo ejecutable. **Nota post-verificacion:** este descarte es cuestionable — la sintaxis persiste en lineas 210 y 1045 del spec actualizado, dentro de secciones que se leen como especificaciones de implementacion (no como pseudocodigo). PLT-1 quedo PARCIAL por esta misma razon. |
+| Sintaxis bash `$(type ...)` invalida en Windows | Pseudocodigo en un spec, no codigo ejecutable. **Nota post-verificacion:** descarte original cuestionable, pero la sintaxis fue corregida al resolver SEC-1 y PLT-1 esta ahora RESUELTO. |
 | `heartbeat-runner.bat` subdefinido | Archivo planificado; nivel de detalle apropiado para spec |
 | Contradiccion inline vs subprocess | Evolucion arquitectonica intencional |
 | Gmail MCP server sin identificar | Documentado en investigaciones |

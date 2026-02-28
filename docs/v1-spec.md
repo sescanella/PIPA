@@ -245,8 +245,16 @@ sequenceDiagram
 
 **Paso 1 — Activacion del Heartbeat**
 1. Task Scheduler de Windows ejecuta `heartbeat-runner.bat` cada 30 minutos
-2. El script verifica pre-flight: horario activo (07:00-22:00 Santiago), lock file ausente, conexion a internet
-3. Si pasa pre-flight, ejecuta `claude -p "$(type HEARTBEAT.md)"`
+2. `heartbeat-runner.bat` delega a `python agent/main.py`
+3. `main.py` verifica pre-flight: horario activo (07:00-22:00 Santiago), lock file ausente, conexion a internet
+4. Si hay emails para procesar (ver Paso 2), `main.py` invoca Claude con ambos flags de seguridad:
+   ```
+   claude -p "Procesa estos emails: [message_ids]. {heartbeat_content}" \
+     --allowedTools "Read,mcp__pipa_gmail__*" \
+     --disallowedTools "Bash,Write,Edit,WebFetch,WebSearch" \
+     --max-turns 5 --output-format json --mcp-config mcp.json
+   ```
+   Donde `heartbeat_content = open('HEARTBEAT.md').read()`
 
 **Paso 2 — Monitoreo de Gmail (ejecutado por el wrapper Python, antes de invocar Claude)**
 1. El wrapper lee `config.json` para obtener la lista blanca de remitentes
@@ -309,7 +317,7 @@ PIPA usa dos mecanismos complementarios:
 
 **Regla de horario activo:** Solo opera entre 07:00 y 22:00 hora Santiago (America/Santiago). Si un ciclo cae fuera de ese rango:
 - Si son las 22:15, NO ejecutar. El siguiente ciclo se mueve a las 07:00 del dia siguiente.
-- El pre-flight check del `heartbeat-runner.bat` valida esto antes de invocar Claude.
+- El pre-flight check de `agent/main.py` (invocado por `heartbeat-runner.bat`) valida esto antes de invocar Claude.
 
 ### 6.2 HEARTBEAT.md
 
@@ -1201,9 +1209,9 @@ Wake: "Wake the computer to run this task": Habilitado
 StartWhenAvailable: true
 ```
 
-### 14.2 heartbeat-runner.bat
+### 14.2 Flujo del Ciclo (`agent/main.py`)
 
-Flujo del script wrapper:
+`heartbeat-runner.bat` solo delega a Python (`python agent\main.py`). Toda la lógica del ciclo está en `agent/main.py`:
 
 1. Verificar horario activo (07:00-22:00 Santiago)
 2. Adquirir lock atomico (`mkdir tmp/heartbeat.lock`; si falla, verificar stale por PID)
@@ -1216,11 +1224,12 @@ Flujo del script wrapper:
 5. **Si hay emails para procesar:**
    - **5a.** Invocar Claude heartbeat para procesar emails y enviar replies:
      ```
-     claude -p "Procesa estos emails: [message_ids]. $(type HEARTBEAT.md)" \
+     claude -p "Procesa estos emails: [message_ids]. {heartbeat_content}" \
        --mcp-config mcp.json --output-format json --max-turns 5 \
        --allowedTools "Read,mcp__pipa_gmail__*" \
        --disallowedTools "Bash,Write,Edit,WebFetch,WebSearch"
      ```
+     Donde `heartbeat_content = open('HEARTBEAT.md').read()`
    - **5b.** Por cada PDF descargado, invocar skill extract-plano como subproceso separado:
      ```
      claude -p "Ejecuta extract-plano con {pdf_path}" \
@@ -1269,7 +1278,7 @@ Flujo del script wrapper:
 
 #### a) Creacion atomica con `mkdir`
 
-- Usar `os.makedirs("tmp/heartbeat.lock")` (o `mkdir tmp\heartbeat.lock` en batch) en vez de crear un archivo
+- Usar `os.makedirs("tmp/heartbeat.lock")` en vez de crear un archivo
 - `mkdir` es atomico en NTFS — falla si el directorio ya existe, sin ventana TOCTOU
 - Si `mkdir` tiene exito → se adquirio el lock
 - Si `mkdir` falla (directorio existe) → otro ciclo esta corriendo, verificar si es stale

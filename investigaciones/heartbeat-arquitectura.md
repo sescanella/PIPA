@@ -1,6 +1,10 @@
-# Arquitectura del Sistema Heartbeat (basado en OpenClaw)
+# Arquitectura del Sistema Heartbeat — Implementacion con Claude Code CLI
 
-> Documento de referencia para replicar el sistema de Heartbeat de OpenClaw en un contexto agnostico de stack, con delivery via Gmail y monitoreo de inbox de correo.
+> Documento de referencia para implementar el sistema Heartbeat usando **Claude Code CLI** (`claude -p`) corriendo en un Mac Mini siempre encendido, programado con `launchd`, usando MCP servers para Gmail/Calendar y Pushover/Telegram para alertas.
+>
+> **Stack elegido:** Claude Code CLI (headless) + launchd (macOS) + MCP servers + archivos JSON de estado
+>
+> **Proyectos de referencia:** OpenClaw (patron original), Murmur (daemon de cron para AI), Harper Reed (email triage con MCP)
 
 ## 1. Que es el Heartbeat
 
@@ -14,196 +18,268 @@ Sin heartbeat, un agente solo trabaja cuando el humano inicia la conversacion. C
 - El agente **monitorea proactivamente** (emails, tareas, calendarios)
 - **Decide autonomamente** si algo merece atencion
 - **Alerta solo cuando es necesario** (no spamea)
-- **Mantiene continuidad** entre sesiones (recuerda que revisaba)
+- **Mantiene continuidad** via archivos de estado en disco (no necesita sesion persistente)
 - **Se auto-evoluciona** (puede modificar su propia checklist)
+
+### Decision de stack: Claude Code CLI, no API directa
+
+En vez de programar directamente contra la Anthropic API (`anthropic.messages.create()`), usamos el binario `claude` con su flag `-p` (headless mode). Ventajas:
+
+| Claude Code CLI (`claude -p`) | API directa |
+|---|---|
+| MCP servers integrados (Gmail, Calendar) | Hay que construir tool-calling layer |
+| Permisos granulares (`--allowedTools`) | Hay que implementar sandboxing manual |
+| CLAUDE.md como contexto automatico | Hay que inyectar system prompt manual |
+| Hooks del ciclo de vida (Stop, PostToolUse) | No existen |
+| Session resumption si se necesita | Hay que manejar conversation history |
+| ~30-50% mas tokens por scaffolding interno | Mas eficiente en tokens |
+
+**Conclusion:** Claude Code CLI es el camino correcto para MVP. Solo migrar a API directa si el costo de tokens se vuelve un problema critico.
 
 ---
 
 ## 2. Arquitectura General
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    HEARTBEAT SYSTEM                          │
-│                                                             │
-│  ┌──────────┐    ┌───────────┐    ┌──────────────────┐     │
-│  │ SCHEDULER │───>│   WAKE    │───>│  HEARTBEAT       │     │
-│  │ (Timer)   │    │ DISPATCHER│    │  RUNNER           │     │
-│  └──────────┘    └───────────┘    └────────┬─────────┘     │
-│       ^               ^                    │               │
-│       │               │                    v               │
-│  ┌────┴────┐    ┌─────┴─────┐    ┌──────────────────┐     │
-│  │  CRON   │    │  EXTERNAL │    │   AGENT LOOP     │     │
-│  │  EVENTS │    │  TRIGGERS │    │   (LLM Turn)     │     │
-│  └─────────┘    └───────────┘    └────────┬─────────┘     │
-│                                           │               │
-│                    ┌──────────────────────┼──────────┐     │
-│                    │                      │          │     │
-│                    v                      v          v     │
-│            ┌────────────┐    ┌─────────┐  ┌────────┐     │
-│            │  DELIVERY  │    │ MEMORY  │  │ SKILLS │     │
-│            │  (Gmail)   │    │         │  │        │     │
-│            └────────────┘    └─────────┘  └────────┘     │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                    HEARTBEAT SYSTEM (Claude Code CLI)                 │
+│                                                                      │
+│  ┌─────────────┐    ┌───────────────┐    ┌─────────────────────┐    │
+│  │   launchd    │───>│  heartbeat-   │───>│  claude -p           │    │
+│  │ (cada 30min) │    │  runner.sh    │    │  "$(cat HEARTBEAT.md)"│    │
+│  └─────────────┘    └───────────────┘    └────────┬────────────┘    │
+│                            │                       │                 │
+│                            │                       v                 │
+│                     ┌──────┴──────┐    ┌─────────────────────┐      │
+│                     │ Pre-flight  │    │   MCP SERVERS        │      │
+│                     │ - active hrs│    │   ├─ gmail (read)    │      │
+│                     │ - lockfile  │    │   ├─ calendar        │      │
+│                     │ - enabled?  │    │   └─ tasks           │      │
+│                     └─────────────┘    └────────┬────────────┘      │
+│                                                 │                    │
+│                              ┌──────────────────┼──────────┐        │
+│                              │                  │          │        │
+│                              v                  v          v        │
+│                     ┌──────────────┐   ┌────────────┐ ┌────────┐   │
+│                     │  DELIVERY    │   │  STATE     │ │  LOGS  │   │
+│                     │  ├─ Pushover │   │  (JSON)    │ │        │   │
+│                     │  ├─ Telegram │   │  ├─ dedup  │ │        │   │
+│                     │  ├─ osascript│   │  ├─ last   │ │        │   │
+│                     │  └─ Gmail    │   │  └─ watermark│ │        │   │
+│                     └──────────────┘   └────────────┘ └────────┘   │
+└──────────────────────────────────────────────────────────────────────┘
 ```
+
+**Principio arquitectonico clave: Claude es stateless, el filesystem es stateful.**
+
+Cada invocacion de `claude -p` es una sesion fresca. Claude lee estado de archivos JSON al inicio. El script orquestador escribe estado de vuelta despues de cada ejecucion. Esto es intencional:
+- Evita acumular tokens de contexto (cada sesion cuesta lo mismo)
+- El estado es transparente, auditable, y versionable con git
+- Sobrevive crashes, actualizaciones de Claude Code, y reinicios
 
 ---
 
 ## 3. Los 6 Componentes Fundamentales
 
-### 3.1 SCHEDULER (Planificador)
+### 3.1 SCHEDULER — launchd (macOS)
 
 **Responsabilidad:** Disparar el heartbeat a intervalos regulares.
 
-**Principios de diseno:**
-- Usa `setTimeout` (no `setInterval`) para calcular el proximo disparo exacto
-- Intervalo configurable (default: 30 minutos)
-- Soporte para **Active Hours** (no despertar al humano a las 3am)
-- El timer es `.unref()` (no mantiene vivo el proceso si todo lo demas termino)
+**Decision: launchd, no cron ni setTimeout**
 
-**Config necesaria:**
-```yaml
-heartbeat:
-  every: "30m"                  # Intervalo entre beats
-  activeHours:
-    start: "08:00"              # No antes de las 8am
-    end: "22:00"                # No despues de las 10pm
-    timezone: "America/Mexico_City"
+Para nuestra implementacion con Claude Code CLI, el scheduler NO es codigo propio — es `launchd`, el scheduler nativo de macOS. Ventajas sobre cron:
+- Maneja correctamente sleep/wake del Mac (cron no garantiza ejecucion post-sleep)
+- `StartCalendarInterval` dispara en tiempos de reloj predecibles (:00 y :30)
+- Se integra con el Keychain de macOS
+- Persiste automaticamente entre reinicios
+
+**Plist de launchd:**
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.pipa.heartbeat</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/TUUSUARIO/heartbeat/scripts/heartbeat-runner.sh</string>
+  </array>
+
+  <!-- Disparar a :00 y :30 de cada hora -->
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Minute</key><integer>30</integer></dict>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key>
+    <string>/Users/TUUSUARIO</string>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/Users/TUUSUARIO/heartbeat/logs/launchd-stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/TUUSUARIO/heartbeat/logs/launchd-stderr.log</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/TUUSUARIO/heartbeat</string>
+</dict>
+</plist>
 ```
 
-**Pseudo-codigo:**
-```
-function scheduleNext():
-    nextDue = now + intervalMs
-    if activeHours defined:
-        if nextDue outside activeHours:
-            nextDue = next_start_of_active_hours
-    timer = setTimeout(onTimerFire, nextDue - now)
-    timer.unref()
+**Instalar y administrar:**
+```bash
+# Instalar
+cp com.pipa.heartbeat.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.pipa.heartbeat.plist
 
-function onTimerFire():
-    requestHeartbeatNow(reason="interval")
-```
+# Probar manualmente
+launchctl start com.pipa.heartbeat
 
-### 3.2 WAKE DISPATCHER (Despachador de Despertares)
-
-**Responsabilidad:** Centralizar y deduplicar todas las fuentes de disparo del heartbeat.
-
-El heartbeat no solo se dispara por timer. Tambien por:
-- Cron jobs que completan
-- Eventos externos (webhook de Gmail PubSub, etc.)
-- Wake manual del usuario
-- Ejecuciones async que terminan
-
-**Principios de diseno:**
-- **Coalescencia temporal (250ms):** Multiples triggers en <250ms se fusionan en uno
-- **Cola de prioridad:** No todos los triggers son iguales
-- **Proteccion anti-concurrencia:** Nunca ejecutar dos heartbeats simultaneos
-- **Retry con backoff:** Si falla, reintentar con backoff exponencial
-
-**Prioridades de trigger:**
-| Prioridad | Razon | Ejemplo |
-|---|---|---|
-| 0 (baja) | retry | Reintento por fallo previo |
-| 1 | interval | Timer periodico normal |
-| 2 | cron/wake | Cron job o wake generico |
-| 3 (alta) | action/manual | Wake manual, webhook, hook |
-
-**Pseudo-codigo:**
-```
-pendingWakes = PriorityQueue()
-running = false
-coalesceTimer = null
-
-function requestHeartbeatNow(reason, coalesceMs=250):
-    pendingWakes.enqueue(reason, priority(reason))
-
-    if coalesceTimer:
-        return  # Ya hay un timer de coalescencia corriendo
-
-    coalesceTimer = setTimeout(dispatchBatch, coalesceMs)
-
-function dispatchBatch():
-    coalesceTimer = null
-    if running:
-        return  # Ya hay un heartbeat corriendo, se re-despacha al terminar
-
-    running = true
-    batch = pendingWakes.drainAll()
-
-    try:
-        for wake in batch:
-            result = await runHeartbeatOnce(wake)
-            if result.status == "skipped" and result.reason == "queue-busy":
-                pendingWakes.enqueue("retry", RETRY_PRIORITY)
-                scheduleRetry(1000ms)
-    catch error:
-        # Re-encolar todo el batch para retry
-        for wake in batch:
-            pendingWakes.enqueue("retry", RETRY_PRIORITY)
-        scheduleRetry(1000ms)
-    finally:
-        running = false
-        if pendingWakes.notEmpty():
-            setTimeout(dispatchBatch, 0)
+# Desactivar
+launchctl unload ~/Library/LaunchAgents/com.pipa.heartbeat.plist
 ```
 
-### 3.3 HEARTBEAT RUNNER (Ejecutor del Beat)
+**Active hours:** Se implementan dentro del script `heartbeat-runner.sh`, no en el plist. El plist siempre dispara; el script decide si ejecutar o salir temprano.
+
+**Bug conocido:** Claude Code almacena tokens OAuth en el Keychain de macOS, que NO es accesible desde launchd/SSH. **Solucion:** Usar `ANTHROPIC_API_KEY` desde un archivo con `chmod 600`, no depender del Keychain. (GitHub issues #5515, #9403)
+
+### 3.2 ANTI-CONCURRENCIA (Lockfile)
+
+**Responsabilidad:** Garantizar que nunca haya dos heartbeats corriendo al mismo tiempo.
+
+En la implementacion original de OpenClaw (un proceso Node.js persistente), esto lo maneja un Wake Dispatcher en memoria con coalescencia y colas de prioridad. En nuestra implementacion con launchd + CLI, el mecanismo es mas simple: un **lockfile**.
+
+```bash
+LOCKFILE="/tmp/pipa-heartbeat.lock"
+
+# Si ya hay un heartbeat corriendo, salir
+if [ -f "$LOCKFILE" ]; then
+    log "Previous run still in progress. Skipping."
+    exit 0
+fi
+
+# Crear lockfile y asegurar limpieza al salir
+trap "rm -f $LOCKFILE" EXIT
+touch "$LOCKFILE"
+
+# ... ejecutar heartbeat ...
+```
+
+**Nota sobre Wake Dispatcher:** En el MVP con launchd, no necesitamos coalescencia ni prioridades. Cada disparo es independiente. Si en el futuro agregamos webhooks de Gmail PubSub para reactividad instantanea, podemos evolucionar a un daemon Node.js con el pattern completo de OpenClaw (ver seccion original en la documentacion de referencia).
+
+### 3.3 HEARTBEAT RUNNER (heartbeat-runner.sh)
 
 **Responsabilidad:** Ejecutar un ciclo completo de heartbeat.
 
-Este es el componente central. Cada ejecucion sigue este flujo:
+Este es el componente central. Es un script bash que orquesta todo el flujo:
 
 ```
 PRE-FLIGHT CHECKS
-    ├─ Heartbeat habilitado? (global + por agente)
-    ├─ Dentro de active hours?
-    ├─ Cola principal ocupada? → skip + retry
-    └─ HEARTBEAT.md efectivamente vacio? → skip (ahorra API calls)
+    ├─ Dentro de active hours? (07:00 - 23:00)
+    ├─ Lockfile libre? (no hay otro heartbeat corriendo)
+    └─ HEARTBEAT.md tiene contenido?
 
-PROMPT RESOLUTION
-    ├─ Si trigger = exec-event → prompt de resultado de ejecucion
-    ├─ Si trigger = cron-event → prompt de recordatorio cron
-    └─ Si trigger = interval  → prompt default (lee HEARTBEAT.md)
+INVOCACION DE CLAUDE
+    └─ claude -p "$(cat HEARTBEAT.md)"
+       --output-format json
+       --max-turns 3
+       --allowedTools "Read,mcp__gmail__*,mcp__calendar__*"
+       --disallowedTools "Bash,Write,Edit"
 
-LLM EXECUTION
-    └─ Turno COMPLETO del agente en la sesion principal
-       (acceso a tools, skills, memoria, todo)
-
-RESPONSE PROCESSING
-    ├─ Extraer payload de respuesta
-    ├─ Strip HEARTBEAT_OK del inicio/final
-    ├─ Dedup: mismo texto en <24h? → suprimir
+RESPONSE PROCESSING (en bash, parseando JSON con jq)
+    ├─ Extraer .result del JSON
+    ├─ Verificar si contiene HEARTBEAT_OK
+    ├─ Dedup: comparar hash contra state/alert-hashes.json
     └─ Clasificar: OK (silencio) vs Alert (entregar)
 
 POST-PROCESSING
-    ├─ Si OK: podar transcript, restaurar timestamp de sesion
-    ├─ Si Alert: entregar via canal configurado (Gmail)
-    └─ Emitir evento de status para observabilidad
-
-SCHEDULE
-    └─ Actualizar nextDueMs, re-armar timer
+    ├─ Si OK: log y salir
+    ├─ Si Alert: invocar send-alert.sh (Pushover/Telegram/osascript)
+    └─ Actualizar state/last-run.json
 ```
 
-**Pre-flight gates (portalas de entrada):**
+**Script completo del runner:**
 
+```bash
+#!/bin/bash
+# heartbeat-runner.sh — Orquestador del heartbeat con Claude Code CLI
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+LOG_FILE="$REPO_DIR/logs/heartbeat-$(date +%Y-%m-%d).log"
+STATE_FILE="$REPO_DIR/state/last-run.json"
+LOCKFILE="/tmp/pipa-heartbeat.lock"
+SECRETS_FILE="$HOME/.pipa-secrets"
+
+log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" | tee -a "$LOG_FILE"; }
+
+# --- Cargar secretos ---
+source "$SECRETS_FILE"  # exporta ANTHROPIC_API_KEY
+
+# --- Active Hours (07:00 - 23:00) ---
+HOUR=$(date +%H)
+if [[ "$HOUR" -lt 7 || "$HOUR" -ge 23 ]]; then
+    log "Outside active hours ($HOUR:xx). Skipping."
+    exit 0
+fi
+
+# --- Lockfile ---
+if [ -f "$LOCKFILE" ]; then
+    log "Previous run still in progress. Skipping."
+    exit 0
+fi
+trap "rm -f $LOCKFILE" EXIT
+touch "$LOCKFILE"
+
+# --- Ejecutar Claude Code ---
+log "Starting heartbeat..."
+mkdir -p "$REPO_DIR/logs" "$REPO_DIR/state"
+
+RESULT=$(claude -p "$(cat "$REPO_DIR/HEARTBEAT.md")" \
+    --output-format json \
+    --max-turns 3 \
+    --allowedTools "Read,mcp__gmail__list_emails,mcp__gmail__get_email,mcp__calendar__list_events" \
+    --disallowedTools "Bash,Write,Edit,WebFetch,WebSearch" \
+    2>>"$LOG_FILE") || {
+    log "ERROR: claude exited with code $?"
+    exit 1
+}
+
+# --- Parsear resultado ---
+RESPONSE=$(echo "$RESULT" | jq -r '.result // "HEARTBEAT_OK"' 2>/dev/null || echo "$RESULT")
+
+# --- Actualizar estado ---
+echo "{\"last_run\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"status\":\"$(echo "$RESPONSE" | head -c 100)\"}" \
+    > "$STATE_FILE"
+
+# --- Decidir: OK o ALERTA ---
+if echo "$RESPONSE" | grep -q "HEARTBEAT_OK"; then
+    log "Status: OK. No action required."
+else
+    log "Status: ALERT. Dispatching..."
+    echo "$RESPONSE" | "$REPO_DIR/scripts/send-alert.sh"
+fi
 ```
-function runHeartbeatOnce(params):
-    # Gate 1: Habilitado?
-    if not heartbeatsEnabled: return skip("disabled")
 
-    # Gate 2: Active hours?
-    if not isWithinActiveHours(config, now): return skip("outside-hours")
+**Flags criticos de Claude Code:**
 
-    # Gate 3: Cola ocupada?
-    if mainQueue.size > 0: return skip("queue-busy")  # retry later
-
-    # Gate 4: HEARTBEAT.md vacio? (solo para trigger=interval)
-    if params.reason == "interval":
-        content = readFile("HEARTBEAT.md")
-        if isEffectivelyEmpty(content): return skip("empty-file")
-
-    # Pasar a ejecucion...
-```
+| Flag | Valor | Proposito |
+|---|---|---|
+| `-p` | `"$(cat HEARTBEAT.md)"` | Modo headless, prompt desde archivo |
+| `--output-format` | `json` | Parseable con `jq` (incluye `result`, `session_id`, `cost`) |
+| `--max-turns` | `3` | Limitar profundidad (leer emails + decidir + responder) |
+| `--allowedTools` | MCP tools especificos | Solo herramientas necesarias |
+| `--disallowedTools` | `Bash,Write,Edit` | Defensa en profundidad: sin acceso a shell ni archivos |
 
 ### 3.4 HEARTBEAT.md (El Checklist Vivo)
 
@@ -275,31 +351,55 @@ function processHeartbeatResponse(reply):
 
 **Responsabilidad:** Entregar alertas al humano via el canal configurado.
 
-Para tu caso: **Gmail** como canal de delivery.
+**Canales disponibles (de mejor a peor para nuestro caso):**
 
-**Opciones de target:**
-| Target | Comportamiento |
-|---|---|
-| `none` | Ejecuta el heartbeat pero no envia nada externamente |
-| `gmail` | Envia email al destinatario configurado |
-| `last` | Envia al ultimo canal usado por el humano |
+| Canal | Latencia | Costo | Setup | Ideal para |
+|---|---|---|---|---|
+| **Pushover** | Instantaneo (push) | $5 una vez | Bajo | Alertas urgentes al celular |
+| **Telegram Bot** | Instantaneo (push) | Gratis | Bajo | Alertas urgentes al celular |
+| **macOS osascript** | Instantaneo (local) | Gratis | Cero | Cuando estas en el Mac |
+| **Gmail via MCP** | Segundos | Gratis | Medio | Digests, alertas no urgentes |
 
-**Consideraciones para Gmail delivery:**
-```yaml
-heartbeat:
-  target: "gmail"
-  to: "tu-email@gmail.com"
-  delivery:
-    subject_prefix: "[PIPA Heartbeat]"
-    format: "html"        # o "plain"
-    thread_mode: "daily"  # Un thread por dia para no spamear
+**Recomendacion:** Pushover o Telegram para alertas urgentes + osascript como fallback local.
+
+**Script de alerta con Pushover:**
+```bash
+#!/bin/bash
+# send-alert.sh — Lee JSON de stdin y envia push notification
+ALERT_JSON=$(cat)
+SUMMARY=$(echo "$ALERT_JSON" | jq -r '.alerts[0].summary // "Heartbeat Alert"' 2>/dev/null || echo "$ALERT_JSON" | head -c 200)
+
+# Pushover (requiere PUSHOVER_TOKEN y PUSHOVER_USER en secrets)
+curl -s \
+  --form-string "token=$PUSHOVER_TOKEN" \
+  --form-string "user=$PUSHOVER_USER" \
+  --form-string "title=[PIPA] Heartbeat Alert" \
+  --form-string "message=$SUMMARY" \
+  --form-string "priority=0" \
+  --form-string "sound=pushover" \
+  https://api.pushover.net/1/messages.json
+
+# macOS notification como backup
+osascript -e "display notification \"$SUMMARY\" with title \"PIPA Heartbeat\" sound name \"Ping\""
+```
+
+**Script de alerta con Telegram:**
+```bash
+#!/bin/bash
+# send-alert-telegram.sh
+ALERT_JSON=$(cat)
+SUMMARY=$(echo "$ALERT_JSON" | jq -r '.alerts[0].summary // "Heartbeat Alert"' 2>/dev/null || echo "$ALERT_JSON" | head -c 200)
+
+curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+  -d "chat_id=${TELEGRAM_CHAT_ID}" \
+  -d "text=[PIPA] $SUMMARY" \
+  -d "parse_mode=Markdown"
 ```
 
 **Comportamiento inteligente:**
-- Las alertas se agrupan en un thread diario (no 48 emails/dia)
-- `HEARTBEAT_OK` nunca genera email
-- Dedup de 24h previene emails repetidos
-- Active hours previenen emails nocturnos
+- `HEARTBEAT_OK` nunca genera notificacion
+- Dedup de 24h previene alertas repetidas (via `state/alert-hashes.json`)
+- Active hours previenen notificaciones nocturnas
 
 ---
 
@@ -476,43 +576,140 @@ En 24 horas con intervalos de 30min, el heartbeat genera **48 exchanges**. Si ca
 
 ## 7. Consideraciones para Implementacion
 
-### Componentes minimos para un MVP
+### Estructura del repositorio
 
-| Componente | Complejidad | Impacto |
+```
+heartbeat/
+├── HEARTBEAT.md                    # Checklist de Claude (version controlled)
+├── CLAUDE.md                       # Contexto del proyecto para Claude
+├── .mcp.json                       # Configuracion de MCP servers
+├── config/
+│   └── active-hours.json           # Horarios activos (o hardcoded en script)
+├── scripts/
+│   ├── heartbeat-runner.sh         # Orquestador principal
+│   ├── send-alert.sh               # Entrega de alertas (Pushover/Telegram)
+│   └── prune-logs.sh               # Rotacion de logs (cron semanal)
+├── state/
+│   ├── last-run.json               # Timestamp y resultado del ultimo run
+│   └── alert-hashes.json           # Hashes SHA de alertas enviadas (dedup 24h)
+├── logs/
+│   └── heartbeat-YYYY-MM-DD.log    # Logs diarios
+└── com.pipa.heartbeat.plist        # launchd agent para macOS
+```
+
+### MCP Servers necesarios
+
+Configurar en `.mcp.json` del proyecto:
+
+```json
+{
+  "mcpServers": {
+    "gmail": {
+      "command": "node",
+      "args": ["/path/to/gmail-mcp-server/dist/index.js"],
+      "env": {
+        "GOOGLE_CLIENT_ID": "${GOOGLE_CLIENT_ID}",
+        "GOOGLE_CLIENT_SECRET": "${GOOGLE_CLIENT_SECRET}"
+      }
+    },
+    "calendar": {
+      "command": "npx",
+      "args": ["google-calendar-mcp"],
+      "env": {
+        "GOOGLE_CALENDAR_CREDENTIALS": "/path/to/credentials.json"
+      }
+    }
+  }
+}
+```
+
+**Opciones de MCP servers para Google:**
+
+| Server | Cobertura | URL |
 |---|---|---|
-| Scheduler basico (setTimeout loop) | Baja | Fundamental |
-| HEARTBEAT.md reader | Baja | Fundamental |
-| LLM turn con tools | Media | Core |
-| HEARTBEAT_OK contract | Baja | Anti-spam |
-| Gmail delivery | Media | Entrega |
-| Dedup 24h | Baja | Anti-spam |
-| Transcript pruning | Media | Salud del contexto |
-| Active hours | Baja | Calidad de vida |
-| System event queue | Media | Reactivo a webhooks |
-| Error backoff | Baja | Resiliencia |
+| `taylorwilsdon/google_workspace_mcp` | Gmail + Calendar + Drive + Docs + Tasks | El mas completo, un solo server |
+| `GongRzhe/Gmail-MCP-Server` | Solo Gmail | Mas simple, menos dependencias |
+| `nspady/google-calendar-mcp` | Solo Calendar | Multi-cuenta, eventos recurrentes |
+| `ngs/google-mcp-server` | Gmail + Calendar + Drive | Instalable con Homebrew |
 
-### Dependencias externas necesarias
+**Setup OAuth (una sola vez, manual):**
+1. Crear proyecto en Google Cloud Console
+2. Habilitar Gmail API y Calendar API
+3. Crear credenciales OAuth 2.0 (Client ID + Client Secret)
+4. Ejecutar el MCP server interactivamente la primera vez → completar flow OAuth en el browser
+5. Tokens se guardan en `~/.config/mcp-servers/*/token.json` → `chmod 600`
+6. Ejecuciones posteriores usan el refresh token automaticamente
 
-- **LLM API** (Claude, GPT, etc.) - Para el turno del agente
-- **Gmail API** - Para leer inbox y enviar alertas (OAuth2 + Gmail API v1)
-- **Almacenamiento de sesion** - Archivo JSON o SQLite para estado
-- **Scheduler** - setTimeout nativo del lenguaje o libreria cron
+### Costos estimados
+
+| Escenario | Costo mensual |
+|---|---|
+| 48 runs/dia, sin caching, API pay-as-you-go | $23 - $33 |
+| 32 runs/dia (solo active hours) + prompt caching | **$9 - $15** |
+| Claude Max plan ($100/mes) | $100 flat (incluye uso interactivo) |
+
+**Desglose por run (Sonnet 4.6, pay-as-you-go):**
+
+| Componente | Tokens estimados |
+|---|---|
+| HEARTBEAT.md + CLAUDE.md (input, cacheable) | 800 - 1,200 |
+| MCP tool responses — emails, calendar (input, variable) | 1,000 - 3,000 |
+| Claude razonamiento + respuesta (output) | 200 - 500 |
+| **Total por run** | **~2,200 - 5,100 tokens** |
+
+**Prompt caching** reduce el costo del contenido estatico (HEARTBEAT.md, CLAUDE.md) de $3.00/M a $0.30/M — una reduccion del 90%. El contenido variable (emails, calendario) no se cachea.
+
+### Seguridad
+
+**Capas de proteccion:**
+
+1. **`--allowedTools` (allowlist):** Solo los MCP tools necesarios
+   ```
+   --allowedTools "Read,mcp__gmail__list_emails,mcp__gmail__get_email,mcp__calendar__list_events"
+   ```
+
+2. **`--disallowedTools` (denylist como defensa en profundidad):**
+   ```
+   --disallowedTools "Bash,Write,Edit,WebFetch,WebSearch"
+   ```
+   Nota: Bug conocido (#12232) donde `--allowedTools` puede ignorarse con `bypassPermissions`. Siempre usar `--disallowedTools` como backup.
+
+3. **API key en archivo seguro:**
+   ```bash
+   echo 'export ANTHROPIC_API_KEY=sk-ant-...' > ~/.pipa-secrets
+   chmod 600 ~/.pipa-secrets
+   # NUNCA en git, NUNCA en el plist en texto plano
+   ```
+
+4. **OAuth tokens con permisos restringidos:**
+   ```bash
+   chmod 600 ~/.config/mcp-servers/*/token.json
+   ```
+
+**Lo que el agente NUNCA debe tener acceso a:**
+- `Bash` tool (prevencion de command injection via emails maliciosos)
+- `Write`/`Edit` tools (no puede modificar archivos del sistema)
+- `WebFetch`/`WebSearch` (no puede hacer requests HTTP arbitrarios)
+- `~/.ssh/`, `.env` de otros proyectos
 
 ### Gmail-specific: Como monitorear inbox
 
-**Opcion A: Polling (simple)**
-- Cada heartbeat llama `gmail.users.messages.list(q="is:unread newer_than:2h")`
-- Pro: Simple, sin setup extra
+**Opcion A: Polling via MCP (simple — MVP)**
+- Cada heartbeat, Claude usa `mcp__gmail__list_emails` para buscar no-leidos
+- Pro: Simple, sin setup extra mas alla del MCP server
 - Con: Latencia de hasta 30min para emails urgentes
 
-**Opcion B: Gmail PubSub Push (reactivo)**
+**Opcion B: Gmail PubSub Push (reactivo — futuro)**
 - Configurar `gmail.users.watch()` con Cloud Pub/Sub
-- Recibir webhook instantaneo cuando llega email nuevo
-- Enqueue como system event → wake inmediato del heartbeat
+- Recibir webhook → disparar heartbeat inmediato
 - Pro: Latencia ~segundos
-- Con: Requiere setup de Google Cloud Pub/Sub
+- Con: Requiere Google Cloud Pub/Sub + un daemon receptor
 
-**Recomendacion:** Empezar con Opcion A (polling via heartbeat), migrar a B cuando se necesite latencia baja.
+**Recomendacion:** Empezar con A. La arquitectura soporta B sin cambios — solo agregas un trigger adicional.
+
+### Alternativa sin codigo: runCLAUDErun
+
+Para quien quiera un MVP sin escribir scripts: **runCLAUDErun** (runclauderun.com) es una app nativa macOS gratuita que programa ejecuciones de Claude Code con GUI. No tiene dedup, lockfile, ni alerts — pero sirve para validar el concepto rapido.
 
 ---
 
@@ -531,24 +728,63 @@ En 24 horas con intervalos de 30min, el heartbeat genera **48 exchanges**. Si ca
 
 ---
 
-## 9. Referencias
+## 9. Proyectos de Referencia
 
-- **Repositorio OpenClaw:** https://github.com/openclaw/openclaw
-- **Heartbeat docs:** `docs/gateway/heartbeat.md`
-- **Heartbeat runner source:** `src/infra/heartbeat-runner.ts`
-- **Wake dispatcher:** `src/infra/heartbeat-wake.ts`
-- **Cron vs Heartbeat:** `docs/automation/cron-vs-heartbeat.md`
+| Proyecto | URL | Que aprender |
+|---|---|---|
+| **OpenClaw** | github.com/openclaw/openclaw | Patron original del heartbeat. HEARTBEAT.md, dedup, pruning |
+| **Murmur** | github.com/t0dorakis/murmur | Daemon de cron para AI. El mas parecido a nuestra implementacion |
+| **Harper Reed email triage** | harper.blog | Claude Code + MCP para Gmail en produccion real |
+| **runCLAUDErun** | runclauderun.com | App macOS GUI para scheduling sin codigo |
+| **claude-code-scheduler** | github.com/jshchnz/claude-code-scheduler | Plugin de scheduling cross-platform |
+| **Continuous Claude** | github.com/AnandChowdhary/continuous-claude | Pattern de loop continuo con memoria en archivos |
+| **Ductor** | github.com/PleasePrompto/ductor | Claude Code + Telegram + cron jobs |
+
+**Documentacion oficial de Anthropic:**
+- Headless mode: code.claude.com/docs/en/headless
+- Hooks: code.claude.com/docs/en/hooks-guide
+- Agent SDK: platform.claude.com/docs/en/agent-sdk/overview
+- Long-running agents: anthropic.com/engineering/effective-harnesses-for-long-running-agents
+
+**Reportes de investigacion detallados (en esta carpeta):**
+- `research-claudecode-headless-automation.md` — CLI flags, scheduling, auth
+- `research-background-process-patterns.md` — launchd, systemd, cron, pm2, Docker
+- `research-claude-agent-sdk.md` — SDK programatico, hooks, MCP servers
+- `research-alwayson-agents-cli.md` — Proyectos comunitarios y patrones
+- `research-heartbeat-claudecode.md` — Arquitectura especifica, costos, seguridad
 
 ---
 
 ## 10. Proximos Pasos
 
-1. [ ] Definir el HEARTBEAT.md inicial para monitoreo de Gmail
-2. [ ] Elegir stack de implementacion
-3. [ ] Implementar scheduler + runner MVP
-4. [ ] Configurar Gmail API (OAuth2 + read/send scopes)
-5. [ ] Implementar HEARTBEAT_OK contract + dedup
-6. [ ] Agregar transcript pruning
-7. [ ] Configurar active hours
-8. [ ] Testing: correr 24h y auditar falsos positivos/negativos
-9. [ ] Iterar HEARTBEAT.md basado en patrones observados
+### Fase 1: Core Loop (1-2 dias)
+1. [ ] Crear repo `heartbeat/` con estructura de carpetas
+2. [ ] Escribir HEARTBEAT.md inicial (solo calendario: "eventos en los proximos 90 min")
+3. [ ] Escribir `heartbeat-runner.sh` con active hours + lockfile
+4. [ ] Crear archivo de secretos `~/.pipa-secrets` con `ANTHROPIC_API_KEY`
+5. [ ] Probar `claude -p "$(cat HEARTBEAT.md)" --output-format json` manualmente
+6. [ ] Instalar plist de launchd y verificar que dispara cada 30 min
+7. [ ] Alertas via `osascript` (notificacion nativa macOS)
+
+### Fase 2: Integracion (3-5 dias)
+8. [ ] Configurar MCP server de Gmail (OAuth2 flow interactivo una vez)
+9. [ ] Configurar MCP server de Google Calendar
+10. [ ] Expandir HEARTBEAT.md con reglas de email
+11. [ ] Implementar `state/alert-hashes.json` para deduplicacion 24h
+12. [ ] Implementar `send-alert.sh` con Pushover o Telegram
+13. [ ] Parsear JSON de salida con `jq` para detectar HEARTBEAT_OK vs alerta
+
+### Fase 3: Polish (1 semana)
+14. [ ] Configurar Pushover ($5) o Telegram Bot para push al celular
+15. [ ] Rotacion de logs (`prune-logs.sh` via cron semanal)
+16. [ ] Verificar prompt caching funciona (revisar `cost` en JSON de salida)
+17. [ ] Agregar MCP server de tasks (Notion, Todoist, etc.)
+18. [ ] Testing: correr 48h y auditar falsos positivos/negativos
+19. [ ] Iterar HEARTBEAT.md basado en patrones observados
+20. [ ] Poner alerta de gasto mensual a $30 en consola de Anthropic
+
+### Fase Futura: Evolucion
+- [ ] Migrar de polling a Gmail PubSub para reactividad instantanea
+- [ ] Evaluar Agent SDK (`@anthropic-ai/claude-agent-sdk`) si se necesitan hooks programaticos
+- [ ] Agregar control remoto via Telegram Bot (enviar comandos al heartbeat)
+- [ ] Dashboard web local para ver estado y logs

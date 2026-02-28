@@ -1,6 +1,10 @@
 .env
 credentials.json
 token.json
+mcp.json
 tmp/
 *.lock
+**/.venv/
+__pycache__/
+*.pyc
 .DS_Store

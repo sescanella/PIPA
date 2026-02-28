@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "pipa-gmail": {
+      "type": "stdio",
+      "command": "C:\\PIPA\\mcp_servers\\gmail\\.venv\\Scripts\\python.exe",
+      "args": ["C:\\PIPA\\mcp_servers\\gmail\\server.py"],
+      "env": {
+        "GOOGLE_TOKEN_PATH": "C:\\PIPA\\token.json",
+        "GOOGLE_CREDENTIALS_PATH": "C:\\PIPA\\credentials.json",
+        "ATTACHMENT_DOWNLOAD_DIR": "C:\\PIPA\\tmp"
+      }
+    }
+  }
+}

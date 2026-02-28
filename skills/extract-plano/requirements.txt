@@ -1,0 +1,3 @@
+PyMuPDF>=1.24.0      # Renderizado y cropping de PDFs
+Pillow>=10.0.0       # Procesamiento de imagenes
+pydantic>=2.0.0      # Validacion de esquemas JSON

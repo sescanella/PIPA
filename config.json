@@ -1,0 +1,32 @@
+{
+  "version": "1.0",
+  "agent": {
+    "name": "PIPA",
+    "timezone": "America/Santiago",
+    "active_hours": {
+      "start": "07:00",
+      "end": "22:00"
+    },
+    "heartbeat_interval_minutes": 30
+  },
+  "gmail": {
+    "account": "projecto.pipa1@gmail.com",
+    "whitelist": [
+      "sescanellacaceres@gmail.com"
+    ]
+  },
+  "owner": {
+    "email": "sescanellacaceres@gmail.com",
+    "alert_consecutive_failures": 3,
+    "alert_cooldown_hours": 24
+  },
+  "skills": {
+    "extract-plano": {
+      "enabled": true,
+      "model": "haiku",
+      "max_turns": 10,
+      "timeout_seconds": 300
+    }
+  },
+  "email_signature": "-- Procesado automaticamente por PIPA v1"
+}
